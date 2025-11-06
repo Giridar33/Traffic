@@ -24,6 +24,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import time
+import boto3
+from botocore.exceptions import NoCredentialsError
+
 
 # Flask Configuration
 app = Flask(__name__)
@@ -169,32 +172,32 @@ def run_traffic_controller(n_lanes, video_paths, output_path, model_path="traffi
             }
     
     update_progress('initialization', 5, 'Validating video files...')
-    print(f"🚀 Starting traffic analysis for {n_lanes} lanes...")
-    print(f"🔍 Video paths: {video_paths}")
+    print(f" Starting traffic analysis for {n_lanes} lanes...")
+    print(f" Video paths: {video_paths}")
     
     # Validate all video files exist
     for i, video_path in enumerate(video_paths):
         if not os.path.exists(video_path):
             error_msg = f"Video file not found: {video_path}"
-            print(f"❌ {error_msg}")
+            print(f" {error_msg}")
             raise FileNotFoundError(error_msg)
-        print(f"✅ Video {i+1} validated: {video_path}")
+        print(f" Video {i+1} validated: {video_path}")
     
     update_progress('initialization', 8, 'Loading YOLO model...')
-    print("📦 Loading YOLO model...")
+    print(" Loading YOLO model...")
     
     # Load YOLO v11 model for vehicle detection
     model = YOLO('yolo11n.pt')
-    print("✅ YOLO v11 model loaded successfully")
+    print("YOLO v11 model loaded successfully")
     agent = DDQNAgent(n_lanes)
     
     update_progress('initialization', 10, 'Loading DDQN agent...')
     
     # Try to load pre-trained model
     if agent.load_model(model_path):
-        print(f"💡 Loaded previous knowledge from {model_path}")
+        print(f" Loaded previous knowledge from {model_path}")
     else:
-        print("⚠️ No previous model found – starting fresh.")
+        print(" No previous model found – starting fresh.")
 
     update_progress('initialization', 15, 'Opening video files...')
     print(f"📹 Opening {len(video_paths)} video file(s)...")
@@ -209,13 +212,13 @@ def run_traffic_controller(n_lanes, video_paths, output_path, model_path="traffi
             caps.append(cap)
         else:
             error_msg = f"Failed to open video file: {path}"
-            print(f"   ❌ {error_msg}")
+            print(f"    {error_msg}")
             raise ValueError(error_msg)
     
-    print(f"✅ All {len(caps)} video files opened successfully")
+    print(f" All {len(caps)} video files opened successfully")
 
     # Get video dimensions and properties
-    print("📊 Reading video properties...")
+    print(" Reading video properties...")
     width = int(caps[0].get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(caps[0].get(cv2.CAP_PROP_FPS))
@@ -228,7 +231,7 @@ def run_traffic_controller(n_lanes, video_paths, output_path, model_path="traffi
     print(f"   Duration: {total_frames/fps:.2f} seconds")
 
     update_progress('initialization', 20, 'Setting up output video...')
-    print("🎬 Setting up output video writer...")
+    print(" Setting up output video writer...")
     
     # Setup output video with H264 codec for better browser support
     fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H264 codec
@@ -240,11 +243,11 @@ def run_traffic_controller(n_lanes, video_paths, output_path, model_path="traffi
     )
     
     if not out.isOpened():
-        print("⚠️  H264 codec failed, trying mp4v...")
+        print("  H264 codec failed, trying mp4v...")
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width * n_lanes, target_height))
     
-    print(f"✅ Video writer created with codec: {'H264' if out.isOpened() else 'mp4v'}")
+    print(f" Video writer created with codec: {'H264' if out.isOpened() else 'mp4v'}")
 
     frame_count = 0
     rewards, car_counts = [], []
@@ -276,7 +279,7 @@ def run_traffic_controller(n_lanes, video_paths, output_path, model_path="traffi
             break
         
         if frame_count == 0:
-            print("   ✅ First frame read successfully - processing starting!")
+            print("   First frame read successfully - processing starting!")
 
         frames = [cv2.resize(frame, (width, target_height)) for frame in frames]
         counts = [get_vehicle_count(model, f) for f in frames]
@@ -1047,6 +1050,26 @@ def api_create_analysis():
         'message': 'Analysis started'
     }), 201
 
+def upload_to_s3(local_file, bucket_name, s3_path):
+    """Uploads a file to S3 and returns its public URL."""
+    s3 = boto3.client('s3')
+    try:
+        s3.upload_file(local_file, bucket_name, s3_path)
+        # Make the object publicly accessible
+        s3.put_object_acl(ACL='public-read', Bucket=bucket_name, Key=s3_path)
+        public_url = f"https://{bucket_name}.s3.ap-south-1.amazonaws.com/{s3_path}"
+        print(f" Uploaded: {public_url}")
+        return public_url
+    except FileNotFoundError:
+        print(f" File not found: {local_file}")
+        return None
+    except NoCredentialsError:
+        print(" AWS credentials not found or invalid.")
+        return None
+    except Exception as e:
+        print(f" S3 upload failed: {e}")
+        return None
+
 
 def process_analysis_async(analysis_id, n_lanes, video_paths, location_name):
     """Process traffic analysis asynchronously"""
@@ -1058,7 +1081,6 @@ def process_analysis_async(analysis_id, n_lanes, video_paths, location_name):
     print(f"   Lanes: {n_lanes}", flush=True)
     print(f"   Videos: {video_paths}", flush=True)
     print(f"{'='*60}\n", flush=True)
-    
     try:
         with app.app_context():
             print(f"✅ App context acquired for analysis {analysis_id}", flush=True)
@@ -1106,40 +1128,64 @@ def process_analysis_async(analysis_id, n_lanes, video_paths, location_name):
                     per_lane_counts=results.get('per_lane_counts')
                 )
                 
+                # === Upload video and charts to S3 ===
+                BUCKET_NAME = "traffic369"
+                print("📤 Uploading output video and charts to S3...")
+                video_s3_url = None
+                if os.path.exists(output_path):
+                    video_s3_url = upload_to_s3(
+                        output_path,
+                        BUCKET_NAME,
+                        f"videos/{os.path.basename(output_path)}"
+                    )
+                
+                charts_s3 = {}
+                for key, path in charts.items():
+                    full_path = os.path.join(app.config['STATIC_FOLDER'], path.lstrip('/'))
+                    if os.path.exists(full_path):
+                        s3_key = f"charts/{os.path.basename(path)}"
+                        s3_url = upload_to_s3(full_path, BUCKET_NAME, s3_key)
+                        if s3_url:
+                            charts_s3[key] = s3_url
+                
+                if video_s3_url:
+                    analysis.output_video = video_s3_url
+                else:
+                    analysis.output_video = f"/static/videos/location_{analysis.location_id}/{os.path.basename(output_path)}"
+                
+                if charts_s3:
+                    charts = charts_s3
+                    print("✅ Uploaded successfully to S3.")
+
                 print(f"✅ Charts generated successfully", flush=True)
                 print(f"   Rewards chart: {charts.get('rewards', 'MISSING')}", flush=True)
                 print(f"   Counts chart: {charts.get('counts', 'MISSING')}", flush=True)
                 
                 analysis.status = 'completed'
-                analysis.output_video = f'/static/videos/location_{analysis.location_id}/{output_filename}'
                 analysis.total_vehicles = results['total_vehicles']
                 analysis.avg_wait_time = results['avg_wait_time']
                 analysis.throughput = results['throughput']
                 analysis.efficiency = results['efficiency']
                 analysis.duration = f"{results['processing_time']}s"
                 analysis.completed_at = datetime.utcnow()
-                
                 detailed_results = {
                     'charts': charts,
                     'lane_metrics': results['lane_metrics'],
                     'processing_time': results['processing_time']
                 }
                 analysis.results_json = json.dumps(detailed_results)
-                
                 db.session.commit()
                 
                 if analysis_id in analysis_progress:
                     del analysis_progress[analysis_id]
                 
                 print(f"✅ Analysis {analysis_id} completed successfully", flush=True)
-                
             except Exception as e:
                 import traceback
                 print(f"❌ Analysis {analysis_id} failed: {str(e)}", flush=True)
                 print(f"   Traceback: {traceback.format_exc()}", flush=True)
                 analysis.status = 'failed'
                 db.session.commit()
-                
                 if analysis_id in analysis_progress:
                     analysis_progress[analysis_id] = {
                         'stage': 'failed',
@@ -1147,7 +1193,6 @@ def process_analysis_async(analysis_id, n_lanes, video_paths, location_name):
                         'message': f'Analysis failed: {str(e)}',
                         'elapsed_time': 0
                     }
-    
     except Exception as outer_e:
         import traceback
         print(f"\n{'='*60}", flush=True)
