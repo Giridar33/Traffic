@@ -1056,7 +1056,7 @@ def upload_to_s3(local_file, bucket_name, s3_path):
     try:
         s3.upload_file(local_file, bucket_name, s3_path)
         # Make the object publicly accessible
-        s3.put_object_acl(ACL='public-read', Bucket=bucket_name, Key=s3_path)
+        
         public_url = f"https://{bucket_name}.s3.ap-south-1.amazonaws.com/{s3_path}"
         print(f" Uploaded: {public_url}")
         return public_url
